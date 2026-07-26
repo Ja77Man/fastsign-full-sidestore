@@ -2,7 +2,7 @@ name: Update deduplicated repo.json
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * 1"
       timezone: "Europe/Zurich"
 
   workflow_dispatch:
@@ -107,15 +107,17 @@ jobs:
 
       - name: Commit changes
         run: |
-          if git diff --quiet -- repo.json; then
-            echo "repo.json has not changed."
-            exit 0
-          fi
-
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Stage first so a newly created repo.json is detected.
           git add repo.json
-          git commit -m "chore: update repo.json"
+
+          if git diff --cached --quiet; then
+            echo "repo.json has not changed."
+            exit 0
+          fi
+
+          git commit -m "chore: update deduplicated repo.json"
           git push origin HEAD:main
