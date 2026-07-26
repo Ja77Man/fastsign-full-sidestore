@@ -129,6 +129,167 @@ jobs:
 
           rm -f repo.download.json
 
+          ```yaml
+name: Update filtered repo.json
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+      timezone: "Europe/Zurich"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-repo-json
+  cancel-in-progress: false
+
+jobs:
+  update-repo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Download repo.json
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            "https://fastsign.dev/repo.json" \
+            --output repo.download.json
+
+      - name: Deduplicate and filter apps
+        run: |
+          python3 <<'PY'
+          import json
+          from datetime import date, datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          source = Path("repo.download.json")
+          output = Path("repo.json")
+
+          with source.open("r", encoding="utf-8") as file:
+              repo = json.load(file)
+
+          apps = repo.get("apps")
+
+          if not isinstance(apps, list):
+              raise ValueError('repo.json must contain an "apps" array')
+
+          today = datetime.now(ZoneInfo("Europe/Zurich")).date()
+
+          try:
+              cutoff = today.replace(year=today.year - 1)
+          except ValueError:
+              cutoff = today.replace(year=today.year - 1, day=28)
+
+          def parse_date(value):
+              if not isinstance(value, str):
+                  return None
+
+              try:
+                  return date.fromisoformat(value[:10])
+              except ValueError:
+                  return None
+
+          def latest_date(app):
+              dates = []
+
+              versions = app.get("versions", [])
+
+              if isinstance(versions, list):
+                  for version in versions:
+                      if isinstance(version, dict):
+                          parsed = parse_date(version.get("date"))
+
+                          if parsed:
+                              dates.append(parsed)
+
+              parsed = parse_date(app.get("versionDate"))
+
+              if parsed:
+                  dates.append(parsed)
+
+              return max(dates) if dates else None
+
+          seen = set()
+          filtered_apps = []
+
+          for app in apps:
+              if not isinstance(app, dict):
+                  continue
+
+              bundle_id = app.get("bundleIdentifier")
+
+              if not isinstance(bundle_id, str):
+                  continue
+
+              bundle_id = bundle_id.strip()
+
+              if not bundle_id or bundle_id in seen:
+                  continue
+
+              seen.add(bundle_id)
+              release_date = latest_date(app)
+
+              if release_date and cutoff <= release_date <= today:
+                  filtered_apps.append(app)
+
+          repo["apps"] = filtered_apps
+
+          with output.open("w", encoding="utf-8") as file:
+              json.dump(repo, file, ensure_ascii=False)
+
+          print(f"Kept {len(filtered_apps)} of {len(apps)} apps")
+          PY
+
+          rm -f repo.download.json
+
+      - name: Minify repo.json
+        run: |
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("repo.json")
+
+          with path.open("r", encoding="utf-8") as file:
+              data = json.load(file)
+
+          with path.open("w", encoding="utf-8", newline="\n") as file:
+              json.dump(
+                  data,
+                  file,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              )
+              file.write("\n")
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add repo.json
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit -m "chore: update filtered repo.json"
+          git push origin HEAD:main
+
       - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
