@@ -1,12 +1,9 @@
 name: Update filtered repo.json
 
 on:
-  # Every Monday at 03:17, including daylight-saving adjustments
   schedule:
     - cron: "00 0 * * 1"
       timezone: "Europe/Zurich"
-
-  # Allow manual runs from the Actions tab
   workflow_dispatch:
 
 permissions:
@@ -22,12 +19,12 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check out main branch
+      - name: Check out repository
         uses: actions/checkout@v6
         with:
           ref: main
 
-      - name: Download source repo
+      - name: Download repo.json
         run: |
           curl \
             --fail \
@@ -35,8 +32,6 @@ jobs:
             --show-error \
             --location \
             --retry 3 \
-            --retry-all-errors \
-            --max-time 300 \
             "https://fastsign.dev/repo.json" \
             --output repo.download.json
 
@@ -49,186 +44,89 @@ jobs:
           from pathlib import Path
           from zoneinfo import ZoneInfo
 
+          source = Path("repo.download.json")
+          output = Path("repo.json")
+          temporary = Path("repo.json.tmp")
 
-          SOURCE_PATH = Path("repo.download.json")
-          OUTPUT_PATH = Path("repo.json")
-          TEMPORARY_PATH = Path("repo.json.tmp")
-          TIMEZONE = ZoneInfo("Europe/Zurich")
-
-
-          def parse_date(value):
-              """
-              Parse an ISO date such as:
-              2026-07-25
-              2026-07-25T12:30:00Z
-              """
-              if not isinstance(value, str):
-                  return None
-
-              value = value.strip()
-
-              if not value:
-                  return None
-
-              try:
-                  # Only the YYYY-MM-DD portion is needed.
-                  return date.fromisoformat(value[:10])
-              except ValueError:
-                  return None
-
-
-          def one_calendar_year_ago(current_date):
-              """
-              Return the same calendar date one year earlier.
-
-              February 29 becomes February 28 when the previous
-              year is not a leap year.
-              """
-              try:
-                  return current_date.replace(
-                      year=current_date.year - 1
-                  )
-              except ValueError:
-                  return current_date.replace(
-                      year=current_date.year - 1,
-                      day=28,
-                  )
-
-
-          def get_latest_release_date(app):
-              """
-              Find the latest valid release date.
-
-              Sources:
-              1. Every versions[].date value
-              2. Top-level versionDate as a fallback/candidate
-              """
-              dates = []
-
-              versions = app.get("versions", [])
-
-              if isinstance(versions, list):
-                  for version in versions:
-                      if not isinstance(version, dict):
-                          continue
-
-                      parsed = parse_date(version.get("date"))
-
-                      if parsed is not None:
-                          dates.append(parsed)
-
-              top_level_date = parse_date(app.get("versionDate"))
-
-              if top_level_date is not None:
-                  dates.append(top_level_date)
-
-              if not dates:
-                  return None
-
-              return max(dates)
-
-
-          # Load and validate the downloaded JSON.
-          with SOURCE_PATH.open("r", encoding="utf-8") as file:
+          with source.open("r", encoding="utf-8") as file:
               repo = json.load(file)
-
-          if not isinstance(repo, dict):
-              raise TypeError(
-                  "The downloaded JSON must contain a top-level object."
-              )
 
           apps = repo.get("apps")
 
           if not isinstance(apps, list):
-              raise TypeError(
-                  'The downloaded JSON must contain an "apps" array.'
-              )
+              raise ValueError('repo.json must contain an "apps" array')
 
+          today = datetime.now(ZoneInfo("Europe/Zurich")).date()
 
-          # ---------------------------------------------------------
-          # Process 1: deduplicate by bundleIdentifier.
-          # The first occurrence is kept.
-          # ---------------------------------------------------------
-          deduplicated_apps = []
-          seen_bundle_identifiers = set()
-          duplicate_count = 0
+          try:
+              cutoff = today.replace(year=today.year - 1)
+          except ValueError:
+              cutoff = today.replace(year=today.year - 1, day=28)
 
-          for index, app in enumerate(apps):
-              if not isinstance(app, dict):
-                  raise TypeError(
-                      f"apps[{index}] is not a JSON object."
-                  )
+          def parse_date(value):
+              if not isinstance(value, str):
+                  return None
 
-              bundle_identifier = app.get("bundleIdentifier")
+              try:
+                  return date.fromisoformat(value[:10])
+              except ValueError:
+                  return None
 
-              if (
-                  not isinstance(bundle_identifier, str)
-                  or not bundle_identifier.strip()
-              ):
-                  raise ValueError(
-                      f'apps[{index}] has no valid '
-                      '"bundleIdentifier". Stopping to avoid '
-                      "accidental data loss."
-                  )
+          def latest_date(app):
+              dates = []
 
-              bundle_identifier = bundle_identifier.strip()
+              for version in app.get("versions", []):
+                  if isinstance(version, dict):
+                      parsed = parse_date(version.get("date"))
 
-              if bundle_identifier in seen_bundle_identifiers:
-                  duplicate_count += 1
-                  continue
+                      if parsed:
+                          dates.append(parsed)
 
-              seen_bundle_identifiers.add(bundle_identifier)
-              deduplicated_apps.append(app)
+              parsed = parse_date(app.get("versionDate"))
 
+              if parsed:
+                  dates.append(parsed)
 
-          # ---------------------------------------------------------
-          # Process 2: keep apps released within the last calendar year.
-          # ---------------------------------------------------------
-          today = datetime.now(TIMEZONE).date()
-          cutoff_date = one_calendar_year_ago(today)
+              return max(dates) if dates else None
 
+          seen = set()
           filtered_apps = []
-          old_count = 0
-          missing_or_invalid_date_count = 0
-          future_date_count = 0
 
-          for app in deduplicated_apps:
-              latest_release_date = get_latest_release_date(app)
-
-              if latest_release_date is None:
-                  missing_or_invalid_date_count += 1
+          for app in apps:
+              if not isinstance(app, dict):
                   continue
 
-              if latest_release_date < cutoff_date:
-                  old_count += 1
+              bundle_id = app.get("bundleIdentifier")
+
+              if not isinstance(bundle_id, str) or not bundle_id.strip():
                   continue
 
-              # Future-dated entries are excluded because they are not
-              # releases from "a year or less ago".
-              if latest_release_date > today:
-                  future_date_count += 1
+              bundle_id = bundle_id.strip()
+
+              if bundle_id in seen:
                   continue
 
-              filtered_apps.append(app)
+              seen.add(bundle_id)
+
+              release_date = latest_date(app)
+
+              if release_date and cutoff <= release_date <= today:
+                  filtered_apps.append(app)
 
           repo["apps"] = filtered_apps
 
-
-          # Write atomically so repo.json is only replaced after success.
-          with TEMPORARY_PATH.open(
-              "w",
-              encoding="utf-8",
-              newline="\n",
-          ) as file:
-              json.dump(
-                  repo,
-                  file,
-                  ensure_ascii=False,
-                  indent=2,
-              )
+          with temporary.open("w", encoding="utf-8") as file:
+              json.dump(repo, file, ensure_ascii=False, indent=2)
               file.write("\n")
 
-          os.replace(TEMPORARY_PATH, OUTPUT_PATH)
+          os.replace(temporary, output)
+
+          print(
+              f"Kept {len(filtered_apps)} of {len(apps)} apps "
+              f"dated from {cutoff} to {today}"
+          )
+          PY
+
           rm -f repo.download.json
 
       - name: Commit changes
@@ -237,11 +135,9 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stage first so a newly created repo.json is detected.
           git add repo.json
 
           if git diff --cached --quiet; then
-            echo "repo.json has not changed."
             exit 0
           fi
 
