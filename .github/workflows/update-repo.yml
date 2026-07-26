@@ -3,7 +3,7 @@ name: Update filtered repo.json
 on:
   # Every Monday at 03:17, including daylight-saving adjustments
   schedule:
-    - cron: "17 3 * * 1"
+    - cron: "00 0 * * 1"
       timezone: "Europe/Zurich"
 
   # Allow manual runs from the Actions tab
@@ -229,22 +229,6 @@ jobs:
               file.write("\n")
 
           os.replace(TEMPORARY_PATH, OUTPUT_PATH)
-
-
-          print(f"Current Zurich date:        {today}")
-          print(f"Oldest permitted date:      {cutoff_date}")
-          print(f"Downloaded apps:            {len(apps)}")
-          print(f"Duplicates removed:         {duplicate_count}")
-          print(f"Apps after deduplication:   {len(deduplicated_apps)}")
-          print(f"Apps older than one year:   {old_count}")
-          print(
-              "Apps with missing/bad date: "
-              f"{missing_or_invalid_date_count}"
-          )
-          print(f"Future-dated apps removed:  {future_date_count}")
-          print(f"Final apps retained:        {len(filtered_apps)}")
-          PY
-
           rm -f repo.download.json
 
       - name: Commit changes
