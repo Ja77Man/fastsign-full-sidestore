@@ -1,0 +1,121 @@
+name: Update deduplicated repo.json
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+      timezone: "Europe/Zurich"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-repo-json
+  cancel-in-progress: false
+
+jobs:
+  update-repo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Download source repo
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --max-time 300 \
+            "https://fastsign.dev/repo.json" \
+            --output repo.download.json
+
+      - name: Remove duplicate apps
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          source_path = Path("repo.download.json")
+          output_path = Path("repo.json")
+          temporary_path = Path("repo.json.tmp")
+
+          with source_path.open("r", encoding="utf-8") as file:
+              repo = json.load(file)
+
+          if not isinstance(repo, dict):
+              raise TypeError("The downloaded JSON must contain a top-level object.")
+
+          apps = repo.get("apps")
+
+          if not isinstance(apps, list):
+              raise TypeError('The downloaded JSON must contain an "apps" array.')
+
+          unique_apps = []
+          seen_bundle_identifiers = set()
+          removed = 0
+
+          for index, app in enumerate(apps):
+              if not isinstance(app, dict):
+                  raise TypeError(f"apps[{index}] is not a JSON object.")
+
+              bundle_identifier = app.get("bundleIdentifier")
+
+              if not isinstance(bundle_identifier, str) or not bundle_identifier.strip():
+                  raise ValueError(
+                      f'apps[{index}] has no valid "bundleIdentifier". '
+                      "Stopping to avoid accidental data loss."
+                  )
+
+              # The first app with this bundleIdentifier is retained.
+              if bundle_identifier in seen_bundle_identifiers:
+                  removed += 1
+                  continue
+
+              seen_bundle_identifiers.add(bundle_identifier)
+              unique_apps.append(app)
+
+          repo["apps"] = unique_apps
+
+          with temporary_path.open("w", encoding="utf-8", newline="\n") as file:
+              json.dump(
+                  repo,
+                  file,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+              file.write("\n")
+
+          # Replace repo.json only after processing succeeds completely.
+          os.replace(temporary_path, output_path)
+
+          print(f"Downloaded apps: {len(apps)}")
+          print(f"Unique apps:     {len(unique_apps)}")
+          print(f"Duplicates removed: {removed}")
+          PY
+
+          rm repo.download.json
+
+      - name: Commit changes
+        run: |
+          if git diff --quiet -- repo.json; then
+            echo "repo.json has not changed."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add repo.json
+          git commit -m "chore: update repo.json"
+          git push origin HEAD:main
