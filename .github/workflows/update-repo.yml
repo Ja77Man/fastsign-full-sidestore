@@ -1,4 +1,4 @@
-name: Update filtered repo.json
+name: Update repository JSON files
 
 on:
   schedule:
@@ -24,7 +24,7 @@ jobs:
         with:
           ref: main
 
-      - name: Download repo.json
+      - name: Download source repository
         run: |
           curl \
             --fail \
@@ -37,109 +37,193 @@ jobs:
             "https://fastsign.dev/repo.json" \
             --output repo.download.json
 
-      - name: Deduplicate and filter apps
+      - name: Build repo.json and repo2.json
         run: |
           python3 <<'PY'
           import json
-          from datetime import date, datetime
+          from datetime import date
           from pathlib import Path
-          from zoneinfo import ZoneInfo
 
+          LIMIT = 2000
           source = Path("repo.download.json")
-          filtered = Path("repo.filtered.json")
 
           with source.open("r", encoding="utf-8") as file:
               repo = json.load(file)
 
           if not isinstance(repo, dict):
-              raise ValueError("repo.json must contain a top-level object")
+              raise ValueError(
+                  "Source JSON must contain a top-level object"
+              )
 
           apps = repo.get("apps")
-          if not isinstance(apps, list):
-              raise ValueError('repo.json must contain an "apps" array')
 
-          today = datetime.now(ZoneInfo("Europe/Zurich")).date()
-          try:
-              cutoff = today.replace(year=today.year - 1)
-          except ValueError:
-              cutoff = today.replace(year=today.year - 1, day=28)
+          if not isinstance(apps, list):
+              raise ValueError(
+                  'Source JSON must contain an "apps" array'
+              )
+
+          def bundle_id(app):
+              value = app.get("bundleIdentifier")
+              return value.strip() if isinstance(value, str) else ""
 
           def parse_date(value):
               if not isinstance(value, str):
                   return None
+
+              value = value.strip()
+
               try:
-                  return date.fromisoformat(value.strip()[:10])
+                  return date.fromisoformat(value[:10])
               except ValueError:
                   return None
 
-          def latest_date(app):
+          def release_date(app):
               dates = []
-              versions = app.get("versions", [])
-
-              if isinstance(versions, list):
-                  for version in versions:
-                      if isinstance(version, dict):
-                          parsed = parse_date(version.get("date"))
-                          if parsed:
-                              dates.append(parsed)
 
               parsed = parse_date(app.get("versionDate"))
+
               if parsed:
                   dates.append(parsed)
 
+              versions = app.get("versions")
+
+              if isinstance(versions, list):
+                  for version in versions:
+                      if not isinstance(version, dict):
+                          continue
+
+                      parsed = parse_date(version.get("date"))
+
+                      if parsed:
+                          dates.append(parsed)
+
+              full_date = app.get("fullDate")
+
+              if isinstance(full_date, str) and len(full_date) >= 8:
+                  parsed = parse_date(
+                      f"{full_date[:4]}-"
+                      f"{full_date[4:6]}-"
+                      f"{full_date[6:8]}"
+                  )
+
+                  if parsed:
+                      dates.append(parsed)
+
               return max(dates) if dates else None
 
-          seen = set()
-          kept = []
+          groups = {}
+          first_apps = []
 
-          for app in apps:
+          for index, app in enumerate(apps):
               if not isinstance(app, dict):
                   continue
 
-              bundle_id = app.get("bundleIdentifier")
-              if not isinstance(bundle_id, str):
+              identifier = bundle_id(app)
+
+              if not identifier:
                   continue
 
-              bundle_id = bundle_id.strip()
-              if not bundle_id or bundle_id in seen:
+              groups.setdefault(identifier, []).append(
+                  (index, app)
+              )
+
+              # repo.json keeps the first occurrence.
+              if len(groups[identifier]) == 1:
+                  first_apps.append(app)
+
+          second_apps = []
+
+          for entries in groups.values():
+              # A second-newest app does not exist when there
+              # is only one occurrence of the bundle ID.
+              if len(entries) < 2:
                   continue
 
-              seen.add(bundle_id)
-              release_date = latest_date(app)
+              def sort_key(entry):
+                  index, app = entry
+                  app_date = release_date(app)
 
-              if release_date and cutoff <= release_date <= today:
-                  kept.append(app)
+                  # Valid dates first, newest to oldest.
+                  # Original source order breaks date ties.
+                  return (
+                      app_date is None,
+                      -(app_date.toordinal() if app_date else 0),
+                      index,
+                  )
 
-          repo["apps"] = kept
+              ranked = sorted(entries, key=sort_key)
+              second_apps.append(ranked[1])
 
-          with filtered.open("w", encoding="utf-8") as file:
-              json.dump(repo, file, ensure_ascii=False)
+          # Preserve source order after selecting each
+          # bundle ID's second-newest occurrence.
+          second_apps.sort(key=lambda entry: entry[0])
 
-          print(f"Kept {len(kept)} of {len(apps)} apps")
+          repo1 = dict(repo)
+          repo1["apps"] = first_apps[:LIMIT]
+
+          repo2 = dict(repo)
+          repo2["apps"] = [
+              app for _, app in second_apps[:LIMIT]
+          ]
+
+          outputs = (
+              (Path("repo.filtered.json"), repo1),
+              (Path("repo2.filtered.json"), repo2),
+          )
+
+          for path, data in outputs:
+              with path.open("w", encoding="utf-8") as file:
+                  json.dump(
+                      data,
+                      file,
+                      ensure_ascii=False,
+                  )
+
+          print(
+              f"repo.json: {len(repo1['apps'])} apps; "
+              f"repo2.json: {len(repo2['apps'])} apps"
+          )
           PY
 
           rm -f repo.download.json
 
-      - name: Minify repo.json
+      - name: Minify JSON files
         run: |
           python3 <<'PY'
           import json
           import os
           from pathlib import Path
 
-          source = Path("repo.filtered.json")
-          output = Path("repo.json")
-          temporary = Path("repo.json.tmp")
+          files = (
+              ("repo.filtered.json", "repo.json"),
+              ("repo2.filtered.json", "repo2.json"),
+          )
 
-          with source.open("r", encoding="utf-8") as file:
-              repo = json.load(file)
+          for source_name, output_name in files:
+              source = Path(source_name)
+              output = Path(output_name)
+              temporary = output.with_suffix(
+                  output.suffix + ".tmp"
+              )
 
-          with temporary.open("w", encoding="utf-8", newline="\n") as file:
-              json.dump(repo, file, ensure_ascii=False, separators=(",", ":"))
-              file.write("\n")
+              with source.open("r", encoding="utf-8") as file:
+                  data = json.load(file)
 
-          os.replace(temporary, output)
-          source.unlink()
+              with temporary.open(
+                  "w",
+                  encoding="utf-8",
+                  newline="\n",
+              ) as file:
+                  json.dump(
+                      data,
+                      file,
+                      ensure_ascii=False,
+                      separators=(",", ":"),
+                  )
+                  file.write("\n")
+
+              os.replace(temporary, output)
+              source.unlink()
           PY
 
       - name: Commit changes
@@ -148,11 +232,11 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add repo.json
+          git add repo.json repo2.json
 
           if git diff --cached --quiet; then
             exit 0
           fi
 
-          git commit -m "chore: update filtered repo.json"
+          git commit -m "chore: update repository JSON files"
           git push origin HEAD:main
